@@ -1,0 +1,22 @@
+variables:
+  LAUNCH_TARGET_HOSTNAME: amdlogin.bsc.es
+  LAUNCH_TARGET_USERNAME: hpai
+  LAUNCH_TARGET_FOLDER: /gpfs/projects/bsc70/hpai/storage/data/
+  LAUNCH_TARGET_SRC_DIR: ./
+  LAUNCH_TARGET_SSH_KEY: ${LAUNCH_TARGET_SSH_KEY_HPAI}
+  AUTOLAUNCHER_VERSION: &AUTOLAUNCHER_VERSION dockerhub
+  LAUNCH_IMAGE_NAME: ${CI_PROJECT_PATH}:${CI_COMMIT_SHORT_SHA}-${CI_COMMIT_REF_NAME}
+  TAGS: nvidia
+stages:
+  - build
+  - transfer
+  - launch
+
+include:
+  - project: "hpai/autolauncher"
+    ref: *AUTOLAUNCHER_VERSION
+    file:
+      - "/templates/autolauncher-build.yml"
+      - "/templates/autolauncher-transfer.yml"
+      - "/templates/autolauncher-launch.yml"
+

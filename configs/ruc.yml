@@ -1,0 +1,39 @@
+benchmark:
+  - task: RuC
+    hdl: sv # sv (SystemVerilog) or v (Verilog)
+    dataset_path: /gpfs/scratch/bsc70/hpai/storage/projects/heka/chips-design/bigcode/datasets/RuC-cve2_b72358c7-16k
+    model_path: /gpfs/scratch/bsc70/hpai/storage/projects/heka/models/  # Folder containing the models
+    output_path: /gpfs/scratch/bsc70/hpai/storage/projects/heka/chips-design/bigcode/results/RuC-CVE2-16k/  # Folder to store the generation results
+    singularity_image: /gpfs/scratch/bsc70/hpai/storage/projects/heka/chips-design/bigcode/containers/inference_images/vllm-openai-0.10.1-k2.sif  # Singularity image for inference
+    evaluation_image: /gpfs/scratch/bsc70/hpai/storage/projects/heka/chips-design/bigcode/containers/inference_images/ruc-eval-slang.sif  # Singularity image for evaluation and benchmark creation
+    models:
+      - name: Qwen2.5-Coder-14B
+        slurm_config_inference: accelerate-partition-bsccs
+        slurm_config_evaluate: general-partition-debug # SLURM configuration for evaluation and benchmark creation
+        precision: bfloat16
+        temperature: 0.2
+        sequence_length_limit: 32768
+        max_tokens: 2048
+        top_p: 0.95
+        top_k: -1
+        n_samples: 1
+        gpu_memory_utilization: 0.85
+        swap_space: 16
+        tensor_parallel_size: 4
+        batch_size: 64
+        debug: true
+      - name: Qwen2.5-Coder-14B-Instruct
+        slurm_config_inference: accelerate-partition-bsccs
+        slurm_config_evaluate: general-partition-debug
+        precision: bfloat16
+        temperature: 0.2
+        sequence_length_limit: 32768
+        max_tokens: 2048
+        top_p: 0.95
+        top_k: -1
+        n_samples: 1
+        gpu_memory_utilization: 0.85
+        swap_space: 16
+        tensor_parallel_size: 4
+        batch_size: 64
+        debug: true

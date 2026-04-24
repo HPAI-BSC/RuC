@@ -1,0 +1,39 @@
+configurations:
+  - type: general-partition-debug
+    account: bsc70
+    qos: gp_debug
+    output: slurm_output/job_%j.out
+    error: slurm_output/job_%j.err
+    nodes: 1
+    time: "02:00:00"
+    ntasks: 1
+    cpus-per-task: 80
+  - type: general-partition-bsccs
+    account: bsc70
+    qos: gp_bsccs
+    output: slurm_output/job_%j.out
+    error: slurm_output/job_%j.err
+    nodes: 1
+    time: "04:00:00"
+    ntasks: 1
+    cpus-per-task: 80
+  - type: accelerate-partition-debug
+    account: bsc70
+    qos: acc_debug
+    output: slurm_output/job_%j.out
+    error: slurm_output/job_%j.err
+    nodes: 1
+    time: "02:00:00"
+    gres: gpu:4
+    ntasks: 1
+    cpus-per-task: 80
+    exclusive: true
+  - type: accelerate-partition-bsccs
+    account: bsc70
+    qos: acc_bsccs
+    output: slurm_output/job_%j.out
+    error: slurm_output/job_%j.err
+    nodes: 1
+    time: "02:00:00"
+    ntasks: 1
+    cpus-per-task: 80
