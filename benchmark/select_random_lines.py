@@ -111,17 +111,24 @@ def select_random_lines_no_fnc(dataset_path, max_tasks, debug):
     candidates_by_rule = {rule: [] for rule in RULES}
 
     for project in os.listdir(dataset_path):
+        print(f"Porcessing {project}")
         project_path = os.path.join(dataset_path, project)
         src_path = os.path.join(project_path, "all_mask_idx.json")
 
         if not os.path.exists(src_path):
+            print(f"all_mask_idx doesn't exist {src_path}")
             continue
 
         with open(src_path) as f:
             mask_idx = json.load(f)
 
+        out_path = os.path.join(dataset_path, project, "mask_idx.json")
+        if os.path.exists(out_path):
+            os.remove(out_path)
+
         for rule, occurrences in mask_idx.items():
             if rule not in RULES:
+                print(f"Rule {rule} not in RULES")
                 continue
 
             for task_num in range(1, len(occurrences) + 1):
@@ -133,6 +140,7 @@ def select_random_lines_no_fnc(dataset_path, max_tasks, debug):
 
     for rule, candidates in candidates_by_rule.items():
         if not candidates:
+            print("No candidates")
             continue
 
         # Group candidates by project
@@ -179,6 +187,8 @@ def select_random_lines_no_fnc(dataset_path, max_tasks, debug):
         for project, task_num in chosen:
             selected_by_project.setdefault(project, {}).setdefault(rule, []).append(task_num)
 
+    print(f"Selected by project: {selected_by_project}")
+
     # Write mask_idx.json per project
     for project, rules in selected_by_project.items():
         src_path = os.path.join(dataset_path, project, "all_mask_idx.json")
@@ -201,6 +211,3 @@ def select_random_lines_no_fnc(dataset_path, max_tasks, debug):
     print("Sampling Summary per Rule")
     for rule in RULES:
         print(f"{rule}: {rule_counts[rule]} samples")
-        print("Sampling Summary per Rule")
-        for rule in RULES:
-            print(f"{rule}: {rule_counts[rule]} samples")

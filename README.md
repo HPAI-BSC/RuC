@@ -155,6 +155,6 @@ To do inference on larger model across multiple nodes, we support vLLM + Ray und
 - vLLM → runs the model across that cluster
 - Benchmark script → sends inference requests
 
-Use as a template `slurm/inference/large/gpt-oss-120b-0109.sh`, and create your own `slurm/inference/large/<model_name>.sh` with your specific configurations. 
+Use as a template `slurm/inference/gpt-oss-120b-0109.sh`, and create your own `slurm/inference/<model_name>.sh` with your specific configurations. 
 In order to run it:
-`sbatch slurm/inference/large/<model_name>.sh`
+`sbatch slurm/inference/<model_name>.sh`

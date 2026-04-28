@@ -1,7 +1,7 @@
 #!/bin/bash
 
-#SBATCH --account=bsc70
-#SBATCH --qos=acc_debug
+#SBATCH --account=
+#SBATCH --qos=
 #SBATCH --output=slurm_output/job_%j.out
 #SBATCH --error=slurm_output/job_%j.err
 #SBATCH --nodes=2
@@ -13,16 +13,16 @@
 
 
 MODEL_NAME="gpt-oss-120b-0109"
-MODEL_PATH="/gpfs/scratch/bsc70/hpai/storage/projects/heka/models/${MODEL_NAME}"
+MODEL_PATH="model_path/${MODEL_NAME}"
 PRECISION="bfloat16"
 
 PROMPT_MODE="chat" # "fim" or "chat"
 HDL="sv" # "v" for Verilog, "sv" for SystemVerilog
 
-SIF_PATH="/gpfs/scratch/bsc70/hpai/storage/projects/heka/chips-design/bigcode/containers/inference_images/vllm_bigcode_gpt-oss_2.sif"
+SIF_PATH= # Path to the Singularity image (SIF file) containing the environment with vLLM and Ray installed
 
-DATASET_PATH="/gpfs/scratch/bsc70/hpai/storage/projects/heka/chips-design/bigcode/datasets/RuC-cve2_b72358c7-16k"
-BASE_OUTPUT_PATH="/gpfs/scratch/bsc70/hpai/storage/projects/heka/chips-design/bigcode/results/RuC-CVE2-16k"
+DATASET_PATH= # Path to the dataset containing the hdl files and the mask_idx.json file with the positions to be filled by the model
+BASE_OUTPUT_PATH= # Base path where the generated outputs will be stored. The final output path will be ${BASE_OUTPUT_PATH}/${MODEL_NAME}/${PROMPT_MODE}
 OUTPUT_PATH="${BASE_OUTPUT_PATH}/${MODEL_NAME}/${PROMPT_MODE}"
  
 SEQUENCE_LENGTH_LIMIT=32768     # Model context length (controls prompt+output)
@@ -61,7 +61,7 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 # Trick to avoid issue: openai_harmony.HarmonyError: error downloading or loading vocab file
 # https://github.com/vllm-project/vllm/issues/22525
 # set once per session (works for both Apptainer and Singularity)
-export SINGULARITY_BIND="/gpfs/scratch/bsc70/hpai/storage/projects/heka/chips-design/encodings:/etc/encodings:ro"
+export SINGULARITY_BIND="/gpfs/scratch/bsc70/hpai/storage/projects/heka/chips-design/encodings:/etc/encodings:ro" # Bind the encodings directory to a read-only location inside the container
 export SINGULARITYENV_TIKTOKEN_ENCODINGS_BASE="/etc/encodings"
 export TIKTOKEN_ENCODINGS_BASE=/etc/encodings
 export TIKTOKEN_RS_CACHE_DIR=/etc/encodings

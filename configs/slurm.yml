@@ -1,25 +1,16 @@
 configurations:
-  - type: general-partition-debug
-    account: bsc70
-    qos: gp_debug
+  - type: general-partition-debug # Name of the SLURM configuration
+    account: # SLURM account to use
+    qos: # SLURM QoS to use
     output: slurm_output/job_%j.out
     error: slurm_output/job_%j.err
     nodes: 1
     time: "02:00:00"
     ntasks: 1
     cpus-per-task: 80
-  - type: general-partition-bsccs
-    account: bsc70
-    qos: gp_bsccs
-    output: slurm_output/job_%j.out
-    error: slurm_output/job_%j.err
-    nodes: 1
-    time: "04:00:00"
-    ntasks: 1
-    cpus-per-task: 80
   - type: accelerate-partition-debug
-    account: bsc70
-    qos: acc_debug
+    account: # SLURM account to use
+    qos: # SLURM QoS to use
     output: slurm_output/job_%j.out
     error: slurm_output/job_%j.err
     nodes: 1
@@ -28,12 +19,3 @@ configurations:
     ntasks: 1
     cpus-per-task: 80
     exclusive: true
-  - type: accelerate-partition-bsccs
-    account: bsc70
-    qos: acc_bsccs
-    output: slurm_output/job_%j.out
-    error: slurm_output/job_%j.err
-    nodes: 1
-    time: "02:00:00"
-    ntasks: 1
-    cpus-per-task: 80
