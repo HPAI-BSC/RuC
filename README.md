@@ -1,6 +1,8 @@
 # **RuC**: HDL-Agnostic Rule Completion Benchmark Generation
 RuC is a grammar-driven, rule-selectable benchmark generator that automatically produces RTL code-completion tasks from a set of input hardware description sources. It uses the target HDL grammar to mask syntactically defined code regions and prompts a model to regenerate them using the surrounding unmasked code as context.
 
+**Paper:** https://arxiv.org/abs/2604.27780
+
 
 ## Overview
 RuC supports three main stages:
@@ -50,7 +52,7 @@ We recommend preprocessing the design (e.g., with vppreproc) to produce a single
 |-- <p2>
 |----<p2_top_module>.sv
 ```
-
+The datasets used in the paper are available on HuggingFace: https://huggingface.co/datasets/HPAI-BSC/RuC-datasets
 
 1. Edit `configs/slurm.yml`.
 Adjust the SLURM configuration to match your cluster setup. Each configuration entry defines a reusable SLURM profile, referenced later in ruc.yml via slurm_config_inference and slurm_config_evaluate.
