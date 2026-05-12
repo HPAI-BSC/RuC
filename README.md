@@ -160,3 +160,20 @@ To do inference on larger model across multiple nodes, we support vLLM + Ray und
 Use as a template `slurm/inference/gpt-oss-120b-0109.sh`, and create your own `slurm/inference/<model_name>.sh` with your specific configurations. 
 In order to run it:
 `sbatch slurm/inference/<model_name>.sh`
+
+## Additional Information
+### License
+The dataset is released under the Apache License 2.0.
+
+### Citation Information
+```
+@misc{domingo2026ruchdlagnosticrulecompletion,
+      title={RuC: HDL-Agnostic Rule Completion Benchmark Generation}, 
+      author={Arnau Ayguadé Domingo and Miquel Alberti-Binimelis and Cristian Gutierrez-Gomez and Emanuele Parisi and Razine Moundir Ghorab and Miquel Moreto and Gokcen Kestor and Dario Garcia-Gasulla},
+      year={2026},
+      eprint={2604.27780},
+      archivePrefix={arXiv},
+      primaryClass={cs.AR},
+      url={https://arxiv.org/abs/2604.27780}, 
+}
+```
