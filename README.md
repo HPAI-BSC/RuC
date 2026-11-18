@@ -19,6 +19,7 @@ From the same sources RuC can generate two types of benchmark:
   files. An agent (OpenCode) works in a real copy of the project, where it can read files
   and run the simulators. Every hole is still scored on its own.
 
+**Paper:** https://arxiv.org/abs/2604.27780
 
 ## How it runs
 
