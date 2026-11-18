@@ -1,0 +1,25 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Job logs
+slurm_output/
+*.log
+*.out
+*.err
+
+# Built by third_party/harbor/setup_harbor.sh
+third_party/harbor/harbor-src/
+third_party/harbor/.venv/
+third_party/harbor/*.tar.gz
+
+# Built by slurm/inference/agentic/fetch_vendor.sh, and the image built from them
+slurm/inference/agentic/vendor/
+*.sif
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store

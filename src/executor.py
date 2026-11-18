@@ -28,6 +28,8 @@ class WorkflowExecutor:
         self.CONFIGS_DIR = Path(__file__).resolve().parent.parent / "configs"
         self.logger = logger
         self.slurm_loader = None
+        # Commands that make singularity available in the job, from `setup` in slurm.yml
+        self.setup_command = "module purge && module load singularity"
 
         # Multi-node execution state
         self.head_node_ip = None
@@ -208,27 +210,10 @@ class WorkflowExecutor:
 
         # ENVIRONMENT SETUP
         dictionary.update(self._setup_environment(slurm_config))
-      
-        # if getattr(self.args, "evaluation_only", False):
-        #     slurm_command = re.sub(r"--qos=\S+", "--qos=gp_bsccs", slurm_command)
-        #     slurm_command = re.sub(r"--gres=gpu:\d+", "", slurm_command)
-        #     slurm_command = re.sub(r"#SBATCH\s+--exclusive", "", slurm_command)
-        #     slurm_command = re.sub(
-        #         r"--cpus-per-task=\d+",
-        #         "--cpus-per-task=80",
-        #         slurm_command,
-        #     )
-
-        #     ruc_command = ruc_command.replace(
-        #         "--save_generations True", "--save_generations False"
-        #     )
-        #     ruc_command = ruc_command.replace(
-        #         "--save_generations_path", "--load_generations_path"
-        #     )
 
         full_cmd = (
             f"{slurm_command} --wrap="
-            f"'module purge && module load singularity && "
+            f"'{self.setup_command} && "
             f"{singularity_command} {ruc_command}'"
         )
 
@@ -298,6 +283,7 @@ class WorkflowExecutor:
         if slurm_key in model and os.path.isfile(self.CONFIGS_DIR / "slurm.yml"):
             slurm_config_raw = self.load_yaml_config(self.CONFIGS_DIR / "slurm.yml")
             self.slurm_loader = SlurmConfigLoader(slurm_config_raw)
+            self.setup_command = slurm_config_raw.get("setup", self.setup_command)
             slurm_configs_commands = self.slurm_loader.get_all_configs()
             slurm_commands = slurm_configs_commands.get(model.get(slurm_key), "")
         else:

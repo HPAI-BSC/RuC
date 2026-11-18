@@ -1,0 +1,145 @@
+Bootstrap: docker
+From: ubuntu:22.04
+
+# Image every agentic task runs in: OpenCode, the HDL simulators and what Harbor's
+# Singularity backend needs. Everything is installed at build time, because compute
+# nodes usually have no internet.
+#
+# Build, from this folder, on a machine with internet:
+#   ./fetch_vendor.sh
+#   singularity build --fakeroot ruc-sim-opencode.sif ruc-sim-opencode.def
+
+%files
+    vendor/node-v22.20.0-linux-x64.tar.xz /opt/node.tar.xz
+    vendor/ocroot.tgz                     /opt/ocroot.tgz
+
+%post -c /bin/bash
+    set -eux
+    set -o pipefail
+    export DEBIAN_FRONTEND=noninteractive
+
+    # tmux and asciinema are not used, but Harbor tries to install them when missing
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl git \
+        xz-utils \
+        tmux asciinema \
+        python3 python3-pip python3-venv \
+        verilator iverilog ghdl \
+        g++ make
+
+    # The container runs as a normal user, so these must be writable by anyone
+    mkdir -p /app /home
+    chmod 1777 /app /home
+
+    # Harbor's in-container server, both system-wide and in the venv Harbor looks for
+    pip3 install --no-cache-dir fastapi "uvicorn[standard]"
+    python3 -m venv /opt/harbor-server
+    /opt/harbor-server/bin/pip install --no-cache-dir fastapi "uvicorn[standard]"
+
+    # Node and OpenCode, from vendor/
+    tar xJf /opt/node.tar.xz -C /usr/local --strip-components=1
+    tar xzf /opt/ocroot.tgz  -C /usr/local
+    rm -f /opt/node.tar.xz /opt/ocroot.tgz
+
+    # Some scripts expect sudo to exist
+    printf '#!/bin/bash\nexec "$@"\n' > /usr/local/bin/sudo
+    chmod 0755 /usr/local/bin/sudo
+
+    # Run OpenCode once with the vllm-local provider, so it caches the npm package that
+    # provider needs. The run itself fails (there is no server), only the cache is kept.
+    export OC_WARM_HOME=/opt/ocbuild
+    mkdir -p "${OC_WARM_HOME}/.config/opencode" /opt/opencode-cache
+    cat > "${OC_WARM_HOME}/.config/opencode/opencode.json" <<'JSON'
+{
+  "provider": {
+    "vllm-local": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "vLLM (local)",
+      "options": { "baseURL": "http://127.0.0.1:1/v1", "apiKey": "EMPTY" },
+      "models": { "warmup": {} }
+    }
+  }
+}
+JSON
+    HOME="${OC_WARM_HOME}" \
+    XDG_CONFIG_HOME="${OC_WARM_HOME}/.config" \
+    XDG_CACHE_HOME=/opt/opencode-cache \
+    timeout 300 opencode --model=vllm-local/warmup run --format=json \
+        --dangerously-skip-permissions -- warmup > /dev/null 2>&1 || true
+    rm -rf "${OC_WARM_HOME}"
+    chmod -R a+rwX /opt/opencode-cache
+
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+
+    # The image is read-only: everything the agent writes goes under /tmp
+    export RUC_STATE_DIR="${RUC_STATE_DIR:-/tmp/ruc-state}"
+    export HOME="${RUC_STATE_DIR}/home"
+    export OPENCODE_STATE_DIR="${OPENCODE_STATE_DIR:-${RUC_STATE_DIR}/opencode}"
+
+    # Must stay $HOME/.config: Harbor writes the provider config to
+    # ~/.config/opencode/ and OpenCode reads it from $XDG_CONFIG_HOME/opencode/
+    export XDG_CONFIG_HOME="${HOME}/.config"
+
+    if [ -d /opt/opencode-cache ]; then
+        export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/opt/opencode-cache}"
+    else
+        export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${OPENCODE_STATE_DIR}/cache}"
+    fi
+    export XDG_DATA_HOME="${OPENCODE_STATE_DIR}/data"
+    export XDG_STATE_HOME="${OPENCODE_STATE_DIR}/state"
+    mkdir -p "${HOME}/.config/opencode" \
+             "${XDG_CONFIG_HOME}" "${XDG_DATA_HOME}" \
+             "${XDG_CACHE_HOME}" "${XDG_STATE_HOME}" 2>/dev/null || true
+
+    # Harbor checks OpenCode with ". ~/.nvm/nvm.sh; opencode --version"
+    if [ ! -f "${HOME}/.nvm/nvm.sh" ]; then
+        mkdir -p "${HOME}/.nvm" 2>/dev/null && : > "${HOME}/.nvm/nvm.sh" 2>/dev/null || true
+    fi
+    export OPENCODE_DISABLE_AUTOUPDATE=1
+
+%test
+    set -eu
+    command -v node && node --version
+    command -v npm  && npm --version
+    command -v opencode
+    opencode --version
+    verilator --version
+    iverilog -V > /dev/null
+    ghdl --version > /dev/null
+    python3 -c "import fastapi, uvicorn, pydantic"
+    /opt/harbor-server/bin/python3 -c "import fastapi, uvicorn, pydantic"
+    test -x /usr/local/bin/sudo
+    test -d /app
+    command -v tmux > /dev/null
+    command -v asciinema > /dev/null
+    if [ "${XDG_CONFIG_HOME}" != "${HOME}/.config" ]; then
+        echo "FAIL: XDG_CONFIG_HOME must be \$HOME/.config, or OpenCode will not find its provider" >&2
+        exit 1
+    fi
+    test -f "${HOME}/.nvm/nvm.sh"
+    if find /opt/opencode-cache -maxdepth 6 -type d -name 'openai-compatible' | grep -q .; then
+        echo "OK: @ai-sdk/openai-compatible is cached under /opt/opencode-cache"
+    else
+        echo "WARNING: @ai-sdk/openai-compatible is not cached, so OpenCode will try to" >&2
+        echo "         download it at run time. Get it with 'npm pack @ai-sdk/openai-compatible'" >&2
+        echo "         and unpack it into /opt/opencode-cache/opencode/node_modules/@ai-sdk/" >&2
+    fi
+
+%labels
+    Purpose Base container of RuC's agentic tasks
+    Agent opencode-ai (npm)
+    HDL verilator iverilog ghdl
+
+%help
+    Base container of RuC's agentic tasks, run by Harbor without --fakeroot.
+    Needs the Harbor built by third_party/harbor/setup_harbor.sh.
+
+    Quick check on a compute node:
+      singularity exec --containall --writable-tmpfs --pwd /app ruc-sim-opencode.sif \
+        bash -c 'touch /app/x && opencode --version && verilator --version'

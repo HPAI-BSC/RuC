@@ -1,18 +1,24 @@
 from antlr4 import *
 from antlr4 import InputStream, CommonTokenStream, ParserRuleContext
 from antlr4.TokenStreamRewriter import TokenStreamRewriter
-from .antlr.SystemVerilogLexer import SystemVerilogLexer
-from .antlr.SystemVerilogParser import SystemVerilogParser
 
 
 def count_nested_rules(ctx):
+    """
+    Number of parser rules in the subtree below `ctx` (iterative rather than 
+    recursive).
+    """
     count = 0
+    stack = [ctx]
 
-    for child in ctx.getChildren():
-        if isinstance(child, ParserRuleContext):
-            count += 1
-            count += count_nested_rules(child)
-    
+    while stack:
+        node = stack.pop()
+
+        for child in node.getChildren():
+            if isinstance(child, ParserRuleContext):
+                count += 1
+                stack.append(child)
+
     return count
 
 
@@ -21,22 +27,22 @@ def get_token_count(tokenizer, text):
     return len(tokens)
 
 
-def fresh_parser(text):
+def create_parser(text, lexer_cls, parser_cls):
     # Consume the text input
     input_stream = InputStream(text)
     # Tokenize the input stream
-    lexer = SystemVerilogLexer(input_stream)
+    lexer = lexer_cls(input_stream)
     # Wrap the lexer in a token stream
     token_stream = CommonTokenStream(lexer)
     # Create a new parser instance
-    parser = SystemVerilogParser(token_stream)
+    parser = parser_cls(token_stream)
     # Create a rewriter for potential code modifications
     rewriter = TokenStreamRewriter(token_stream)
 
     return parser, rewriter
 
 
-def r2(x):
+def round_2(x):
     return round(x, 2)
 
 
@@ -73,7 +79,18 @@ def complete_code(text, line, generation):
 
 
 def find_hdl_files(files, hdl):
-    if hdl == "sv":
-        return [f for f in files if f.endswith(".sv")]
-    elif hdl == "v":
-        return [f for f in files if f.endswith(".v")]
+    return [f for f in files if f.endswith("." + hdl)]
+
+
+def read_occurrence(entry):
+    """
+    Normalize a rule occurrence read from `all_mask_idx.json`.
+
+    A single-file project stores a bare [start, stop] span, a multi-file project stores
+    {"file": <relative source>, "span": [start, stop]}. Both come back here as a
+    (file, span) pair, with `file` None when the project has a single source.
+    """
+    if isinstance(entry, dict):
+        return entry.get("file"), entry["span"]
+
+    return None, entry

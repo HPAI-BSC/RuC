@@ -1,92 +1,88 @@
 #!/bin/bash
-
-#SBATCH --account=
-#SBATCH --qos=
+# Rule-completion inference: serve the model with vLLM (Ray across nodes) and query it.
+#SBATCH --account=<your_account>
+#SBATCH --qos=<your_gpu_qos>
 #SBATCH --output=slurm_output/job_%j.out
 #SBATCH --error=slurm_output/job_%j.err
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --time=02:00:00
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=80
 #SBATCH --ntasks-per-node=1
 #SBATCH --exclusive
 
+# ============================================================================
+# CONFIGURATION PARAMETERS
+# ============================================================================
 
-MODEL_NAME="gpt-oss-120b-0109"
-MODEL_PATH="model_path/${MODEL_NAME}"
-PRECISION="bfloat16"
+# Model
+MODEL_NAME="Qwen3.8-27B"
+MODEL_PATH="/path/to/models/${MODEL_NAME}"
+MODEL_DTYPE="bfloat16"
 
 PROMPT_MODE="chat" # "fim" or "chat"
 HDL="sv" # "v" for Verilog, "sv" for SystemVerilog
 
-SIF_PATH= # Path to the Singularity image (SIF file) containing the environment with vLLM and Ray installed
+# Container Configuration
+SIF_PATH="/path/to/containers/vllm-0.19-prebuilt-compat-transformers.sif"
 
-DATASET_PATH= # Path to the dataset containing the hdl files and the mask_idx.json file with the positions to be filled by the model
-BASE_OUTPUT_PATH= # Base path where the generated outputs will be stored. The final output path will be ${BASE_OUTPUT_PATH}/${MODEL_NAME}/${PROMPT_MODE}
+DATASET_PATH="/path/to/datasets/RuC-Opentitan-NonAgentic-final/"
+BASE_OUTPUT_PATH="/path/to/results/RuC-Opentitan-NonAgentic-final/"
 OUTPUT_PATH="${BASE_OUTPUT_PATH}/${MODEL_NAME}/${PROMPT_MODE}"
- 
-SEQUENCE_LENGTH_LIMIT=32768     # Model context length (controls prompt+output)
-MAX_TOKENS=2048                 # Generation length (controls output length; must be smaller than context length!)
-MAX_NUM_SEQS=248                # This controls the number of requests the model runs concurrently
 
+SEQUENCE_LENGTH_LIMIT=262000     # Context length (prompt + output)
+MAX_TOKENS=48000                  # Output length, below SEQUENCE_LENGTH_LIMIT
+MAX_NUM_SEQS=64                  # Concurrent requests
 
+# Inference params (fixed)
 TEMPERATURE=0.2
 TOP_P=0.95
 TOP_K=-1
 BATCH_SIZE=64
+DEBUG=True
 
-TENSOR_PARALLEL_SIZE=8
+
+# Other configuration values
+TENSOR_PARALLEL_SIZE=4
 PIPELINE_PARALLEL_SIZE=1
 GPU_MEMORY_UTILIZATION=0.9
-SWAP_SPACE=8
-PATH_TEMPORARY_FILES="/dev/shm"
+TIMEOUT_HEAD=600
+TIMEOUT_WORKER=3600
+
+# ============================================================================
+# END OF CONFIGURATION
+# ============================================================================
 
 # Environment variables
 export SLURM_CPU_BIND=none
 export SRUN_CPUS_PER_TASK=80
 export SLURM_GPUS_PER_TASK=4
 export USE_SYSTEM_NCCL=1
-# export NCCL_P2P_DISABLE=1
-export NCCL_IB_HCA="mlx5_0,mlx5_1,mlx5_4,mlx5_5"
+export NCCL_IB_HCA="mlx5_0,mlx5_1,mlx5_4,mlx5_5"     # InfiniBand adapters of your nodes
 export NUMEXPR_MAX_THREADS=80
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
+export HF_HUB_OFFLINE=1
+export HF_HOME=/tmp/huggingface
+export HF_HUB_CACHE=/tmp/huggingface/hub
+export HF_MODULES_CACHE=/tmp/huggingface/modules
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-export TRITON_LIBCUDA_PATH=/usr/local/cuda/compat/lib.real/libcuda.so
-export RAY_CGRAPH_get_timeout=400
-export RAY_CGRAPH_submit_timeout=400
-export VLLM_USE_V1=1
-export VLLM_USE_FLASHINFER_SAMPLER=0
+export TRITON_LIBCUDA_PATH=/.singularity.d/libs
+export RAY_CGRAPH_get_timeout=600
+export RAY_CGRAPH_submit_timeout=600
 
-# Trick to avoid issue: openai_harmony.HarmonyError: error downloading or loading vocab file
-# https://github.com/vllm-project/vllm/issues/22525
-# set once per session (works for both Apptainer and Singularity)
-export SINGULARITY_BIND="/gpfs/scratch/bsc70/hpai/storage/projects/heka/chips-design/encodings:/etc/encodings:ro" # Bind the encodings directory to a read-only location inside the container
-export SINGULARITYENV_TIKTOKEN_ENCODINGS_BASE="/etc/encodings"
-export TIKTOKEN_ENCODINGS_BASE=/etc/encodings
-export TIKTOKEN_RS_CACHE_DIR=/etc/encodings
-
-
+mkdir -p "$HF_HOME" "$HF_HUB_CACHE" "$HF_MODULES_CACHE"
 
 echo "START TIME: $(date)"
-
 set -e
 
 set +x
 module purge
 module load singularity
-
-set -euo pipefail
 set -x
-
-SRUN_ARGS="--wait=60 --kill-on-bad-exit=1"
 
 ray_port=$(python3 -c "import socket; s = socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")
 vllm_port=$(python3 -c "import socket; s = socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")
-
-# Timeout settings (in seconds)
-TIMEOUT_HEAD=300
-TIMEOUT_WORKER=800
 
 # Getting the node names
 nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
@@ -123,51 +119,41 @@ wait_for_ray() {
     done
 }
 
-# Function to poll for VLLM readiness using netcat
+# Wait until vLLM answers on /health, or stop if it died
 wait_for_vllm() {
     local host=$1
     local port=$2
     local timeout=$3
+    local pid=$4
     local interval=10
     local elapsed=0
 
-    echo "Waiting for VLLM at $host:$port (timeout=${timeout}s)"
-
+    echo "Waiting for vLLM to become ready at $host:$port (pid $pid)..."
     while true; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" 2>/dev/null
+            local rc=$?
+            echo "ERROR: vLLM process $pid exited (status $rc) after ${elapsed}s."
+            echo "       Look for the worker traceback above this line in the .err file."
+            return 1
+        fi
 
-        echo "------------------------------------------------"
-        echo "Elapsed time: ${elapsed}s"
-        echo "Checking port $host:$port"
-
-        # 1. Check if port is open
-        if nc -z "$host" "$port"; then
-            echo "SUCCESS: VLLM port is open"
+        if python3 -c "
+import sys, urllib.request
+try:
+    with urllib.request.urlopen('http://$host:$port/health', timeout=2) as r:
+        sys.exit(0 if r.status == 200 else 1)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null; then
+            echo "vLLM service is up at $host:$port after ${elapsed}s."
             return 0
         fi
 
-        echo "Port not open yet."
-
-        # 2. Check if vLLM process exists
-        echo "Checking for vLLM process..."
-        ps aux | grep -E "vllm|python" | grep -v grep || echo "No vLLM process found"
-
-        # 3. Check if port is bound locally
-        echo "Checking local port bindings..."
-        ss -tulnp | grep "$port" || echo "Port $port not bound by any process"
-
-        # 4. Check Ray cluster status
-        echo "Checking Ray status..."
-        singularity exec --nv "$SIF_PATH" bash -c "ray status" 2>&1 || echo "Ray not responding"
-
-        # 5. Try HTTP probe (sometimes server is up but port check fails)
-        echo "Trying HTTP probe..."
-        curl -s "http://$host:$port/v1/models" || echo "HTTP endpoint not responding"
-
         sleep $interval
         elapsed=$((elapsed + interval))
-
         if [ "$elapsed" -ge "$timeout" ]; then
-            echo "ERROR: Timeout waiting for VLLM service at $host:$port"
+            echo "ERROR: Timeout waiting for vLLM on $host:$port after ${elapsed}s."
             return 1
         fi
     done
@@ -205,31 +191,38 @@ done
 echo "Final Ray cluster status:"
 singularity exec --nv $SIF_PATH bash -c "ray status"
 
-
-# Start vLLM server
+# Start vLLM server. 
 server_start_time=$(date +%s)
 singularity exec --nv $SIF_PATH \
-    bash -c "export VLLM_USE_V1=$VLLM_USE_V1 && export VLLM_HOST_IP=$head_node_ip && export VLLM_CUDA_MEM_ALIGN_KV_CACHE=1 && vllm serve ${MODEL_PATH} \
+    bash -c "export VLLM_HOST_IP=$head_node_ip && vllm serve ${MODEL_PATH} \
         --served-model-name ${MODEL_NAME} \
         --host $head_node_ip \
         --port $vllm_port \
         --distributed-executor-backend ray \
         --trust-remote-code \
-        --dtype ${PRECISION} \
-	--max-num-batched-tokens 8192 \
-        --swap-space ${SWAP_SPACE} \
-	--max-num-seqs ${MAX_NUM_SEQS} \
+        --dtype ${MODEL_DTYPE} \
+        --max-num-seqs ${MAX_NUM_SEQS} \
+        --max-model-len ${SEQUENCE_LENGTH_LIMIT} \
         --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION} \
         --tensor-parallel-size ${TENSOR_PARALLEL_SIZE} \
-        --pipeline-parallel-size ${PIPELINE_PARALLEL_SIZE} &"
+        --pipeline-parallel-size ${PIPELINE_PARALLEL_SIZE} \
+        --enable-prefix-caching \
+        --enable-chunked-prefill \
+        --enable-auto-tool-choice \
+        --tool-call-parser qwen3_coder \
+        --reasoning-parser qwen3 \
+        --language-model-only" &
+VLLM_PID=$!
 
 # Wait for VLLM to be ready with error handling
-if ! wait_for_vllm "$head_node_ip" "$vllm_port" "$TIMEOUT_WORKER"; then
+if ! wait_for_vllm "$head_node_ip" "$vllm_port" "$TIMEOUT_WORKER" "$VLLM_PID"; then
     echo "ERROR: VLLM server failed to start"
-    continue
+    kill -9 $VLLM_PID 2>/dev/null || true
+    exit 1
 fi
 
 
+# Relaunching resumes the run. Delete ${OUTPUT_PATH} to start over.
 singularity exec --nv "${SIF_PATH}" \
     bash -c "python3 -u -m inference.generate_ray \
         --model_name ${MODEL_NAME} \
@@ -246,12 +239,12 @@ singularity exec --nv "${SIF_PATH}" \
         --output_path ${OUTPUT_PATH} \
         --prompt_mode ${PROMPT_MODE} \
         --hdl ${HDL} \
+        --debug ${DEBUG} \
     "
-
 
 # Cleanup with error handling
 pkill -f "vllm serve" || echo "Warning: Failed to kill vLLM server process"
-sleep 20  # Increased wait time for better cleanup
+sleep 20
 
 # Force cleanup of any zombie processes
 killall -9 python3.10 2>/dev/null || true
@@ -260,7 +253,6 @@ sleep 5
 # Check Ray cluster health
 if ! singularity exec --nv $SIF_PATH bash -c "ray status" >/dev/null 2>&1; then
     echo "ERROR: Ray cluster appears unhealthy. Attempting to recover..."
-    # Could add Ray cluster recovery logic here if needed
 fi
 
 echo "END TIME: $(date)"

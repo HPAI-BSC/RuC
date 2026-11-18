@@ -1,0 +1,463 @@
+diff -ruN a/src/harbor/agents/installed/base.py b/src/harbor/agents/installed/base.py
+--- a/src/harbor/agents/installed/base.py
++++ b/src/harbor/agents/installed/base.py
+@@ -13,9 +13,13 @@
+ from harbor.agents.base import BaseAgent
+ from harbor.environments.base import BaseEnvironment
+ from harbor.models.agent.context import AgentContext
++from harbor.trial.errors import AgentTimeoutError
+ from harbor.utils.env import parse_bool_env_value
+ from harbor.utils.templating import render_prompt_template
+ 
++# What `timeout` exits with when it kills the command it wrapped.
++_TIMEOUT_EXIT_CODE = 124
++
+ 
+ class NonZeroAgentExitCodeError(RuntimeError):
+     """Raised when the agent process exits with a non-zero exit code."""
+@@ -840,6 +844,16 @@
+             cwd=cwd,
+             timeout_sec=timeout_sec,
+         )
++        if result.return_code == _TIMEOUT_EXIT_CODE and timeout_sec is not None:
++            # The environment wraps a command carrying a deadline in `timeout`, which
++            # reports expiry as 124. Without this a command killed by its own budget is
++            # indistinguishable from one the agent failed on its own, and the trial
++            # records a nonzero exit where a timeout is what happened.
++            raise AgentTimeoutError(
++                f"Command timed out after {timeout_sec} seconds (exit "
++                f"{_TIMEOUT_EXIT_CODE}): {command}"
++            )
++
+         if result.return_code != 0:
+             self.logger.debug(
+                 "Command failed",
+@@ -936,22 +950,40 @@
+         setup_dir = self.logs_dir / "setup"
+         setup_dir.mkdir(parents=True, exist_ok=True)
+ 
+-        try:
+-            await self.install(environment)
+-        except RuntimeError:
+-            raise
+-        except Exception as exc:
+-            raise RuntimeError(f"Agent install failed: {exc}") from exc
+-
++        # Skip a network-dependent install() when the agent is already present
++        # (e.g. baked into the environment image), so offline environments don't
++        # need to reinstall on every trial. Only probed when no version is
++        # pinned: an explicit ``version=`` must always go through install() so a
++        # stale pre-baked binary can't silently satisfy a different pin.
++        already_installed = False
+         if self._version is None:
+             version_cmd = self.get_version_command()
+             if version_cmd:
+                 try:
+-                    version_result = await environment.exec(command=version_cmd)
+-                    if version_result.return_code == 0 and version_result.stdout:
+-                        self._version = self.parse_version(version_result.stdout)
++                    probe_result = await environment.exec(command=version_cmd)
++                    if probe_result.return_code == 0 and probe_result.stdout:
++                        self._version = self.parse_version(probe_result.stdout)
++                        already_installed = True
+                 except Exception:
+-                    pass  # Version detection is best-effort
++                    pass  # Probe is best-effort; treat failure as "not installed"
++
++        if not already_installed:
++            try:
++                await self.install(environment)
++            except RuntimeError:
++                raise
++            except Exception as exc:
++                raise RuntimeError(f"Agent install failed: {exc}") from exc
++
++            if self._version is None:
++                version_cmd = self.get_version_command()
++                if version_cmd:
++                    try:
++                        version_result = await environment.exec(command=version_cmd)
++                        if version_result.return_code == 0 and version_result.stdout:
++                            self._version = self.parse_version(version_result.stdout)
++                    except Exception:
++                        pass  # Version detection is best-effort
+ 
+     # Transient flag set by resume() around run(); command builders read it to
+     # add the agent's native continue-session flag. Declare resume capability
+diff -ruN a/src/harbor/agents/installed/opencode.py b/src/harbor/agents/installed/opencode.py
+--- a/src/harbor/agents/installed/opencode.py
++++ b/src/harbor/agents/installed/opencode.py
+@@ -60,14 +60,51 @@
+     #       continue_loop_on_deny: true
+     _DEFAULT_CONFIG: dict[str, Any] = {}
+ 
+-    def __init__(self, *args, opencode_config: dict[str, Any] | None = None, **kwargs):
++    def __init__(
++        self,
++        *args,
++        opencode_config: dict[str, Any] | None = None,
++        agent_timeout_sec: int | float | str | None = None,
++        context_limit: int | float | str | None = None,
++        output_limit: int | float | str | None = None,
++        **kwargs,
++    ):
+         super().__init__(*args, **kwargs)
+         self._opencode_config: dict[str, Any] = opencode_config or {}
++        # The trial's agent budget, so the exec that runs OpenCode carries a deadline.
++        self._agent_timeout_sec: int | None = self._parse_positive_int(
++            agent_timeout_sec, "agent_timeout_sec"
++        )
++        # The served model's real context/output ceiling. Without these, OpenCode
++        # registers the model with no capability metadata and falls back to its own
++        # default max_tokens per call.
++        self._context_limit: int | None = self._parse_positive_int(
++            context_limit, "context_limit"
++        )
++        self._output_limit: int | None = self._parse_positive_int(
++            output_limit, "output_limit"
++        )
+         # The rendered instruction, captured in run() so the trajectory can
+         # include the user turn (OpenCode's run stream may omit it).
+         self._instruction: str | None = None
+ 
+     @staticmethod
++    def _parse_positive_int(raw: int | float | str | None, name: str) -> int | None:
++        """``--ak <name>=...`` arrives as an int, but tolerate a string."""
++        if raw is None or isinstance(raw, bool):
++            return None
++
++        try:
++            value = int(float(str(raw).strip()))
++        except (TypeError, ValueError):
++            raise ValueError(f"Invalid {name} value: {raw!r}. Must be a positive integer.")
++
++        if value <= 0:
++            raise ValueError(f"Invalid {name} value: {raw!r}. Must be a positive integer.")
++
++        return value
++
++    @staticmethod
+     def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+         """Merge *override* into *base* in place, recursing into nested dicts."""
+         for key, value in override.items():
+@@ -252,6 +289,12 @@
+                     tool_name = part.get("tool", "")
+                     tool_input = state.get("input", {})
+                     tool_output = state.get("output")
++                    if tool_output is None:
++                        # A tool part that failed carries `error` and no `output`. Reading
++                        # only `output` drops the failure, leaving a step with tool_calls
++                        # and no observation at all -- which reads as the tool never having
++                        # answered, rather than as an error the agent saw and acted on.
++                        tool_output = state.get("error")
+                     call_id = part.get("callID", part.get("id", ""))
+ 
+                     if not isinstance(tool_input, dict):
+@@ -439,12 +482,30 @@
+ 
+         if self.model_name and "/" in self.model_name:
+             provider, model_id = self.model_name.split("/", 1)
+-            provider_config: dict[str, Any] = {"models": {model_id: {}}}
++
++            # OpenCode's config schema requires both.
++            model_config: dict[str, Any] = {}
++            if self._context_limit and self._output_limit:
++                model_config["limit"] = {
++                    "context": self._context_limit,
++                    "output": self._output_limit,
++                }
++
++            provider_config: dict[str, Any] = {"models": {model_id: model_config}}
+             base_url = os.environ.get("OPENAI_BASE_URL")
+-            if base_url and provider == "openai":
++            if base_url and provider in ("openai", "vllm-local"):
+                 # opencode reads baseURL from provider.options, not the provider root.
+                 # See: https://github.com/anomalyco/opencode config.ts ProviderConfig schema.
+                 provider_config.setdefault("options", {})["baseURL"] = base_url
++            if provider == "vllm-local":
++                # "vllm-local" is RuC's own prefix (configs/ruc.yml agentic.provider) for a
++                # self-served vLLM endpoint, not one of opencode's built-in provider ids, so
++                # opencode needs to be told which SDK adapter to load for it.
++                provider_config.setdefault("npm", "@ai-sdk/openai-compatible")
++                provider_config.setdefault("name", "vLLM (local)")
++                api_key = os.environ.get("OPENAI_API_KEY")
++                if api_key:
++                    provider_config.setdefault("options", {})["apiKey"] = api_key
+             config["provider"] = {provider: provider_config}
+ 
+         # Layer: defaults → auto-generated → job-level overrides.
+@@ -515,6 +576,11 @@
+         elif provider == "openai":
+             keys.append("OPENAI_API_KEY")
+             keys.append("OPENAI_BASE_URL")
++        elif provider == "vllm-local":
++            # RuC's self-served vLLM endpoint (configs/ruc.yml agentic.provider), exposed
++            # as an OpenAI-compatible API -- see build_harbor_env in generate_agent.py.
++            keys.append("OPENAI_API_KEY")
++            keys.append("OPENAI_BASE_URL")
+         elif provider == "opencode":
+             keys.append("OPENCODE_API_KEY")
+         elif provider == "xai":
+@@ -531,6 +597,12 @@
+         env["XDG_DATA_HOME"] = "/logs/agent/opencode/xdg-data"
+         env["XDG_STATE_HOME"] = "/logs/agent/opencode/xdg-state"
+ 
++        if self._output_limit:
++            # OpenCode hardcodes a 32000-token cap per step. This env var
++            # is a documented workaround.
++            # https://github.com/anomalyco/opencode/issues/29363
++            env["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"] = str(self._output_limit)
++
+         skills_command = self._build_register_skills_command()
+         if skills_command:
+             await self.exec_as_agent(environment, command=skills_command, env=env)
+@@ -554,6 +626,7 @@
+                 f"2>&1 </dev/null | stdbuf -oL tee /logs/agent/opencode.txt"
+             ),
+             env=env,
++            timeout_sec=self._agent_timeout_sec,
+         )
+ 
+         if messages := self._error_messages():
+diff -ruN a/src/harbor/environments/singularity/bootstrap.sh b/src/harbor/environments/singularity/bootstrap.sh
+--- a/src/harbor/environments/singularity/bootstrap.sh
++++ b/src/harbor/environments/singularity/bootstrap.sh
+@@ -31,41 +31,75 @@
+   fi
+ fi
+ 
+-# --- Create an isolated venv for the Harbor server at /opt/harbor-server ---
+-_HARBOR_VENV=/opt/harbor-server
++# --- Find an interpreter that can run the Harbor server ---
++# Preference order, so that an image which already ships uvicorn/fastapi needs
++# neither a writable filesystem nor a network: a pre-built venv, then the system
++# interpreter, and only then a venv we build ourselves. The last one is what a
++# rootless run (no --fakeroot) and an offline node cannot rely on.
++_HARBOR_VENV="${HARBOR_SERVER_VENV:-/opt/harbor-server}"
+ _HARBOR_PY="$_HARBOR_VENV/bin/python3"
+-if [ ! -x "$_HARBOR_PY" ]; then
+-  echo "[harbor] Creating server venv at $_HARBOR_VENV..." >&2
+-  "$_SYS_PY" -m venv --without-pip "$_HARBOR_VENV" \
+-    || { echo "[harbor] FATAL: cannot create server venv" >&2; exit 1; }
+-  # Bootstrap pip into the venv (try multiple strategies)
+-  if "$_HARBOR_PY" -c "import ensurepip" 2>/dev/null; then
+-    "$_HARBOR_PY" -m ensurepip --default-pip 2>/dev/null || true
++
++_has_server_deps() {
++  [ -x "$1" ] && "$1" -c "import uvicorn, fastapi" 2>/dev/null
++}
++
++if _has_server_deps "$_HARBOR_PY"; then
++  echo "[harbor] Using pre-built server venv at $_HARBOR_VENV" >&2
++elif _has_server_deps "$_SYS_PY"; then
++  echo "[harbor] Using system interpreter $_SYS_PY (uvicorn/fastapi already present)" >&2
++  _HARBOR_PY="$_SYS_PY"
++else
++  # mkdir -p succeeds on an existing directory we cannot write to, so probe with
++  # a real file before committing to the location.
++  if ! { mkdir -p "$_HARBOR_VENV" && touch "$_HARBOR_VENV/.harbor-write-probe"; } 2>/dev/null; then
++    echo "[harbor] $_HARBOR_VENV is not writable, falling back to /tmp/harbor-server" >&2
++    _HARBOR_VENV=/tmp/harbor-server
++  else
++    rm -f "$_HARBOR_VENV/.harbor-write-probe"
+   fi
+-  if ! "$_HARBOR_PY" -m pip --version 2>/dev/null; then
+-    # Try using system pip to install pip into the venv
+-    if "$_SYS_PY" -m pip --version 2>/dev/null; then
+-      echo "[harbor] Bootstrapping pip from system pip..." >&2
+-      "$_SYS_PY" -m pip install --prefix="$_HARBOR_VENV" --no-deps --force-reinstall pip 2>/dev/null || true
+-    fi
++  _HARBOR_PY="$_HARBOR_VENV/bin/python3"
++
++  if [ ! -x "$_HARBOR_PY" ]; then
++    echo "[harbor] Creating server venv at $_HARBOR_VENV..." >&2
++    # --system-site-packages so the venv can still inherit anything the image
++    # provides, rather than starting empty and requiring a download.
++    "$_SYS_PY" -m venv --without-pip --system-site-packages "$_HARBOR_VENV" \
++      || echo "[harbor] WARNING: cannot create server venv at $_HARBOR_VENV" >&2
+   fi
+-  if ! "$_HARBOR_PY" -m pip --version 2>/dev/null; then
+-    echo "[harbor] Bootstrapping pip via get-pip.py..." >&2
+-    "$_HARBOR_PY" -c "
++
++  if ! _has_server_deps "$_HARBOR_PY"; then
++    # Bootstrap pip into the venv (try multiple strategies)
++    if "$_HARBOR_PY" -c "import ensurepip" 2>/dev/null; then
++      "$_HARBOR_PY" -m ensurepip --default-pip 2>/dev/null || true
++    fi
++    if ! "$_HARBOR_PY" -m pip --version 2>/dev/null; then
++      # Try using system pip to install pip into the venv
++      if "$_SYS_PY" -m pip --version 2>/dev/null; then
++        echo "[harbor] Bootstrapping pip from system pip..." >&2
++        "$_SYS_PY" -m pip install --prefix="$_HARBOR_VENV" --no-deps --force-reinstall pip 2>/dev/null || true
++      fi
++    fi
++    if ! "$_HARBOR_PY" -m pip --version 2>/dev/null; then
++      echo "[harbor] Bootstrapping pip via get-pip.py..." >&2
++      "$_HARBOR_PY" -c "
+ import urllib.request, socket
+ socket.setdefaulttimeout(15)
+ urllib.request.urlretrieve('https://bootstrap.pypa.io/get-pip.py', '/tmp/get-pip.py')
+ " 2>/dev/null \
+-      && "$_HARBOR_PY" /tmp/get-pip.py --quiet 2>/dev/null \
+-      || { echo "[harbor] FATAL: cannot bootstrap pip" >&2; exit 1; }
++        && "$_HARBOR_PY" /tmp/get-pip.py --quiet 2>/dev/null \
++        || echo "[harbor] WARNING: cannot bootstrap pip" >&2
++    fi
++
++    echo "[harbor] Installing server dependencies (uvicorn/fastapi)..." >&2
++    "$_HARBOR_PY" -m pip install --upgrade pip 2>/dev/null || true
++    "$_HARBOR_PY" -m pip install uvicorn fastapi 2>/dev/null || true
+   fi
+ fi
+ 
+-if ! "$_HARBOR_PY" -c "import uvicorn; import fastapi" 2>/dev/null; then
+-  echo "[harbor] Installing server dependencies (uvicorn/fastapi)..." >&2
+-  "$_HARBOR_PY" -m pip install --upgrade pip 2>/dev/null || true
+-  "$_HARBOR_PY" -m pip install uvicorn fastapi 2>/dev/null \
+-    || { echo "[harbor] WARNING: failed to install uvicorn/fastapi, server may fail" >&2; }
++if ! _has_server_deps "$_HARBOR_PY"; then
++  echo "[harbor] WARNING: uvicorn/fastapi not importable by $_HARBOR_PY, server will fail." >&2
++  echo "[harbor]          Install them into the image, or pre-build a venv and point" >&2
++  echo "[harbor]          HARBOR_SERVER_VENV at it." >&2
+ fi
+ 
+ export HARBOR_PYTHON="$_HARBOR_PY"
+diff -ruN a/src/harbor/environments/singularity/server.py b/src/harbor/environments/singularity/server.py
+--- a/src/harbor/environments/singularity/server.py
++++ b/src/harbor/environments/singularity/server.py
+@@ -291,8 +291,11 @@
+     for directory in directories:
+         try:
+             os.makedirs(directory, exist_ok=True)
+-        except FileExistsError:
+-            logger.debug("Skip creating %s (exists and is not a directory)", directory)
++        except OSError as e:
++            # Without --fakeroot the container runs as an ordinary uid, so the
++            # root-owned entries above are simply not ours to create. A task that
++            # actually needs one fails on its own terms later.
++            logger.debug("Skip creating %s: %s", directory, e)
+ 
+     logger.debug("Created common directories")
+ 
+@@ -302,14 +305,22 @@
+ 
+     Singularity fakeroot already runs as "root", so sudo is unnecessary
+     but some scripts expect it to exist.
++
++    Without --fakeroot, /usr/local/bin is root-owned and this cannot be written.
++    The shim is then the image's to provide, so a failure here is only logged.
+     """
+     sudo_path = "/usr/local/bin/sudo"
+-    os.makedirs(os.path.dirname(sudo_path), exist_ok=True)
+ 
+-    with open(sudo_path, "w") as f:
+-        f.write("#!/bin/bash\n")
+-        f.write('exec "$@"\n')
+-    os.chmod(sudo_path, 0o755)
++    try:
++        os.makedirs(os.path.dirname(sudo_path), exist_ok=True)
++
++        with open(sudo_path, "w") as f:
++            f.write("#!/bin/bash\n")
++            f.write('exec "$@"\n')
++        os.chmod(sudo_path, 0o755)
++    except OSError as e:
++        logger.warning(f"Could not create fake sudo at {sudo_path}: {e}")
++        return
+ 
+     logger.debug("Created fake sudo")
+ 
+diff -ruN a/src/harbor/environments/singularity/singularity.py b/src/harbor/environments/singularity/singularity.py
+--- a/src/harbor/environments/singularity/singularity.py
++++ b/src/harbor/environments/singularity/singularity.py
+@@ -67,6 +67,9 @@
+         singularity_force_pull: Force re-pull even if cached (default False).
+         singularity_no_mount: Comma-separated mount types to suppress
+             (default "home,tmp,bind-paths"). Use "" to allow all Singularity mounts.
++        singularity_fakeroot: Pass --fakeroot (default True). Set False on a
++            cluster that delegates no /etc/subuid range to the caller, where
++            singularity refuses to start the container at all.
+     """
+ 
+     def __init__(
+@@ -80,6 +83,7 @@
+         singularity_image_cache_dir: Path | str | None = None,
+         singularity_force_pull: bool = False,
+         singularity_no_mount: str | None = None,
++        singularity_fakeroot: bool = True,
+         **kwargs,
+     ):
+         if singularity_image_cache_dir:
+@@ -89,6 +93,7 @@
+ 
+         self._force_pull = singularity_force_pull
+         self._singularity_no_mount = singularity_no_mount
++        self._singularity_fakeroot = singularity_fakeroot
+ 
+         super().__init__(
+             environment_dir=environment_dir,
+@@ -376,6 +381,12 @@
+                 "--workdir",
+                 self._workdir,
+             ]
++
++            # --fakeroot needs an /etc/subuid range delegated to the caller. Sites
++            # that grant none abort the container outright instead of degrading, so
++            # it has to be switched off up front rather than recovered from.
++            fakeroot_args = ["--fakeroot"] if self._singularity_fakeroot else []
++
+             cmd = [
+                 "singularity",
+                 "exec",
+@@ -383,7 +394,7 @@
+                 "--pwd",
+                 self._workdir,
+                 "--writable-tmpfs",
+-                "--fakeroot",
++                *fakeroot_args,
+                 "--containall",
+                 "--pid",
+                 *bind_mounts,
+@@ -393,7 +404,8 @@
+ 
+             self.logger.debug(
+                 f"Starting Singularity container with server on port "
+-                f"{self._server_port} (attempt {port_attempt + 1}/{max_port_retries})"
++                f"{self._server_port} (attempt {port_attempt + 1}/{max_port_retries}), "
++                f"fakeroot={self._singularity_fakeroot}"
+             )
+ 
+             reserved_socket.close()
+diff -ruN a/src/harbor/trial/trial.py b/src/harbor/trial/trial.py
+--- a/src/harbor/trial/trial.py
++++ b/src/harbor/trial/trial.py
+@@ -454,8 +454,9 @@
+     ) -> None:
+         await self._emit(TrialEvent.AGENT_START)
+ 
++        started_at = self._now()
+         target.agent_result = AgentContext()
+-        target.agent_execution = TimingInfo(started_at=self._now())
++        target.agent_execution = TimingInfo(started_at=started_at)
+ 
+         try:
+             plan = self._network_plan(step_cfg)
+@@ -480,8 +481,16 @@
+                                 timeout=timeout_sec,
+                             )
+         except asyncio.TimeoutError as exc:
++            # A TimeoutError here is not necessarily this wait_for: anything the agent
++            # awaits can raise one, and an environment exec that runs on a shorter clock
++            # of its own gets here first. Reporting `timeout_sec` alone then names a
++            # budget that never expired, so say how long it actually ran and carry the
++            # original message, which is the one that identifies the clock.
++            elapsed_sec = (self._now() - started_at).total_seconds()
++            detail = f": {exc}" if str(exc) else ""
+             raise AgentTimeoutError(
+-                f"Agent execution timed out after {timeout_sec} seconds"
++                f"Agent execution timed out after {elapsed_sec:.0f} seconds "
++                f"(budget {timeout_sec} seconds){detail}"
+             ) from exc
+         finally:
+             target.agent_execution.finished_at = self._now()

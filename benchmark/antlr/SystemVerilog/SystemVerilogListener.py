@@ -3,10 +3,10 @@ from antlr4 import *
 if "." in __name__:
     from .SystemVerilogParser import SystemVerilogParser
 else:
-    from SystemVerilogParser import SystemVerilogParser
+    from benchmark.antlr.SystemVerilog.SystemVerilogParser import SystemVerilogParser
 
 # This class defines a complete listener for a parse tree produced by SystemVerilogParser.
-class SystemVerilogParserListener(ParseTreeListener):
+class SystemVerilogListener(ParseTreeListener):
 
     # Enter a parse tree produced by SystemVerilogParser#library_text.
     def enterLibrary_text(self, ctx:SystemVerilogParser.Library_textContext):

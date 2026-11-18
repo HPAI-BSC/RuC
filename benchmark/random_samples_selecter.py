@@ -1,6 +1,8 @@
 import os
 import json
 import random
+import shutil
+
 
 from configs.rules import RULES
 from .utils import extract_project_task
@@ -70,6 +72,16 @@ def restructure(selected):
     return out
 
 
+def clear_mask_idx(dataset_dir, debug):
+    """ Remove the mask_idx.json every project may still hold from a previous build """
+    for project in os.listdir(dataset_dir):
+        mask_path = os.path.join(dataset_dir, project, "mask_idx.json")
+
+        if os.path.exists(mask_path):
+            if debug: print(f"[INFO] Removing the previous selection {mask_path}")
+            os.remove(mask_path)
+
+
 def write_mask_idx(selected, dataset_dir):
     for project, rules in selected.items():
         src_path = os.path.join(dataset_dir, project, "all_mask_idx.json")
@@ -95,28 +107,54 @@ def select_random_lines(results_path, dataset_path, max_projects, debug):
         results = json.load(f)
 
     empty = process_empty_results(results)
-    selected = select_projects(empty, max_projects)
 
-    if debug:
-        print(f"Number of rules selected: {len(selected)}")
-        for rule, projects in selected.items():
-            print(f"{rule}: {len(projects)}")
+    # Keep all available tasks if max_tasks is set to -1 (--all)
+    if max_projects == -1:
+        selected = empty
+    else:
+        selected = select_projects(empty, max_projects)
 
-    structured = restructure(selected)        
+    print(f"[INFO] Sampling Summary per Rule")
+    for rule, projects in selected.items():
+        print(f"{rule}: {len(projects)} samples")
+
+    structured = restructure(selected)
+
+    # Only the projects selected now get a new mask_idx.json, and inference reads whichever
+    # one it finds, so a project that is not selected any more must not keep its old one
+    clear_mask_idx(dataset_path, debug)
     write_mask_idx(structured, dataset_path)
 
 
-def select_random_lines_no_fnc(dataset_path, max_tasks, debug):
+def select_random_lines_without_fnc(dataset_path, max_tasks, debug):
+    # Keep all available tasks if max_tasks is set to -1 (--all), in this case, straight copy of all_mask_idx
+    if max_tasks == -1:
+        if debug: print("[INFO] Copying all_mask_idx.json to mask_idx.json")
+
+        for project in os.listdir(dataset_path):
+            project_path = os.path.join(dataset_path, project)
+
+            src_path = os.path.join(project_path, "all_mask_idx.json")
+            dst_path = os.path.join(project_path, "mask_idx.json")
+
+            if not os.path.exists(src_path):
+                if debug: print(f"[WARNING] Missing {src_path}")
+                continue
+
+            shutil.copyfile(src_path, dst_path)
+
+        return
+    
     # Collect all candidates globally per rule
     candidates_by_rule = {rule: [] for rule in RULES}
 
     for project in os.listdir(dataset_path):
-        print(f"Porcessing {project}")
+        if debug: print(f"[INFO] Processing {project}")
         project_path = os.path.join(dataset_path, project)
         src_path = os.path.join(project_path, "all_mask_idx.json")
 
         if not os.path.exists(src_path):
-            print(f"all_mask_idx doesn't exist {src_path}")
+            if debug: print(f"[WARNING] all_mask_idx doesn't exist {src_path}")
             continue
 
         with open(src_path) as f:
@@ -128,7 +166,7 @@ def select_random_lines_no_fnc(dataset_path, max_tasks, debug):
 
         for rule, occurrences in mask_idx.items():
             if rule not in RULES:
-                print(f"Rule {rule} not in RULES")
+                print(f"[WARNING] Rule {rule} not in RULES")
                 continue
 
             for task_num in range(1, len(occurrences) + 1):
@@ -140,7 +178,7 @@ def select_random_lines_no_fnc(dataset_path, max_tasks, debug):
 
     for rule, candidates in candidates_by_rule.items():
         if not candidates:
-            print("No candidates")
+            if debug: print("[INFO] No candidates")
             continue
 
         # Group candidates by project
@@ -187,7 +225,7 @@ def select_random_lines_no_fnc(dataset_path, max_tasks, debug):
         for project, task_num in chosen:
             selected_by_project.setdefault(project, {}).setdefault(rule, []).append(task_num)
 
-    print(f"Selected by project: {selected_by_project}")
+    if debug: print(f"[INFO] Selected by project: {selected_by_project}")
 
     # Write mask_idx.json per project
     for project, rules in selected_by_project.items():
@@ -208,6 +246,6 @@ def select_random_lines_no_fnc(dataset_path, max_tasks, debug):
         with open(out_path, "w") as f:
             json.dump(new_idx, f)
 
-    print("Sampling Summary per Rule")
+    print("[INFO] Sampling Summary per Rule")
     for rule in RULES:
         print(f"{rule}: {rule_counts[rule]} samples")

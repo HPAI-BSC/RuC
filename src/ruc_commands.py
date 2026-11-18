@@ -24,12 +24,26 @@ class RucCommandBuilder:
         Determine the launcher command based on the model type and execution mode.
         """
         if self.args.inference:
-            command_ = '"python3 -u -m inference.generate'
+            if self.args.agentic:
+                command_ = '"python3 -u -m inference.generate_agent'
+            else:
+                command_ = '"python3 -u -m inference.generate'
         if self.args.evaluate:
-            command_ = '"python3 -u -m evaluation.eval_ruc'
+            if self.args.self:
+                if self.args.agentic:
+                    command_ = '"python3 -u -m evaluation.evaluate_self_agentic'
+                else:
+                    command_ = '"python3 -u -m evaluation.evaluate_self'
+            elif self.args.agentic:
+                command_ = '"python3 -u -m evaluation.evaluate_agentic_completion'
+            else:
+                command_ = '"python3 -u -m evaluation.evaluate_rule_completion'
         # Not completed yet
         if self.args.benchmark:
-            command_ = '"python3 -u -m benchmark.build_benchmark'
+            if self.args.agentic:
+                command_ = '"python3 -u -m benchmark.agentic_benchmark_builder'
+            else:
+                command_ = '"python3 -u -m benchmark.benchmark_builder'
 
         return command_
 
@@ -62,8 +76,15 @@ class RucCommandBuilder:
         # if task_name:
         #     params.append(f"--task {task_name}")
 
-        # 4. List of excluded parameters
-        excluded_params = {"name", "slurm_config_inference", "slurm_config_evaluation", "multinode"}
+        # 4. List of excluded parameters. `slurm_config_evaluate` is the key the models
+        # in ruc.yml actually use, `slurm_config_evaluation` is kept for older configs.
+        excluded_params = {
+            "name",
+            "slurm_config_inference",
+            "slurm_config_evaluate",
+            "slurm_config_evaluation",
+            "multinode",
+        }
 
         # 5. Add temperature parameter
         # temperature = model_config.get("temperature")
@@ -86,13 +107,18 @@ class RucCommandBuilder:
             # All rest of the parameters
             params.append(f"--{key} {value}")
 
+
         # 7. Add the dataset path and temp files
         if self.args.benchmark:
             path_output = self.benchmark_config.get("output_path")
             if path_output:
-                out_path = os.path.join(path_output, "tmp")
+                if self.args.agentic:
+                    # The agentic builder creates its own tmp/ and tasks/ underneath
+                    out_path = path_output
+                else:
+                    out_path = os.path.join(path_output, "tmp")
                 params.append(f"--output_path '{out_path}'")
-                
+
             max_tasks = self.args.max_tasks
             if max_tasks:
                 params.append(f"--max_tasks {self.args.max_tasks}")
@@ -100,15 +126,45 @@ class RucCommandBuilder:
             fnc = self.args.fnc
             if fnc:
                 params.append(f"--fnc {fnc}")
+
+            all_occ = self.args.all
+            if all_occ:
+                params.append(f"--all {all_occ}")
                 
+        elif self.args.evaluate and self.args.self:
+            path_output = self.benchmark_config.get("output_path")
+            if path_output:
+                out_path = os.path.join(path_output, "self")
+                params.append(f"--output_path '{out_path}'") 
+                
+        elif self.args.agentic:
+            path_output = self.benchmark_config.get("output_path")
+            if path_output:
+                params.append(f"--output_path '{path_output}{model_name}/agent'")
+                # The agent driver reads the tasks the benchmark step emitted
+                params.append(f"--tasks_path '{os.path.join(path_output, 'tasks')}'")
+
+            params.append(f"--model_name {model_name}")
+
         else:
             path_output = self.benchmark_config.get("output_path")
             if path_output:
                 params.append(f"--output_path '{self.benchmark_config.get('output_path')}{model_name}/{self.args.prompt}'")
 
+        # Options of the agentic flow, forwarded to whichever stage is running. Every
+        # entry point parses with parse_known_args, so the ones it does not use are
+        # simply ignored.
+        agentic_config = self.benchmark_config.get("agentic")
+        if agentic_config and self.args.agentic:
+            for key, value in agentic_config.items():
+                if value is None:
+                    continue
+                params.append(f"--{key} {value}")
+
         path_model = self.benchmark_config.get("model_path")
         if path_model:
             params.append(f"--model_path '{self.benchmark_config.get('model_path')}{model_name}'")
+            
         path_dataset = self.benchmark_config.get("dataset_path")
         if path_dataset:
             params.append(f"--dataset_path '{self.benchmark_config.get('dataset_path')}'")

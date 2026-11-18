@@ -1,160 +1,190 @@
-# **RuC**: HDL-Agnostic Rule Completion Benchmark Generation
-RuC is a grammar-driven, rule-selectable benchmark generator that automatically produces RTL code-completion tasks from a set of input hardware description sources. It uses the target HDL grammar to mask syntactically defined code regions and prompts a model to regenerate them using the surrounding unmasked code as context.
+# 🫏 RuC: Grammar-Driven Benchmark Generator for Agentic and Non-Agentic RTL Code Completion
+
+RuC is a framework that turns your own hardware designs into code-completion benchmarks,
+and evaluates models on them. Give it Verilog or SystemVerilog sources, and it:
+
+1. parses them with the HDL grammar,
+2. removes code regions that match the grammar rules you choose (an `assign`, a `case`, a
+   module instantiation, ...),
+3. asks a model to write each region back, and
+4. scores every answer on **STX** (the completed design still compiles) and **EQV** (it is
+   formally equivalent to the original, proven with Yosys).
+
+From the same sources RuC can generate two types of benchmark:
+
+- **Rule completion.** Each task is one hole in one file. The model gets the surrounding
+  code as a fill-in-the-middle (`fim`) or chat (`chat`) prompt and answers with the
+  missing code.
+- **Agentic.** Each task is a whole project with one or more holes, possibly in different
+  files. An agent (OpenCode) works in a real copy of the project, where it can read files
+  and run the simulators. Every hole is still scored on its own.
 
 
-## Overview
-RuC supports three main stages:
-1. **Benchmark creation**  
-   Select rule occurrences from source projects and build a benchmark.
-2. **Inference**  
-   Run a model on the benchmark using either FIM or chat-style prompting.
-3. **Evaluation**  
-   Measure syntax and equivalence correctness of the generated completions.
+## How it runs
 
+RuC is built for a SLURM cluster with Singularity, where compute nodes may have no
+internet. Models are open-weight checkpoints on disk, served with **vLLM**.
 
-## Repository structure
-### configs
-Contains files to define the configuration of RuC.
+- **Benchmark generation and evaluation** run as SLURM jobs inside the evaluation image.
+  `src/run.py` submits them.
+- **Rule-completion inference** runs vLLM inside the inference image. Small models go
+  through `src/run.py`. Models that need several nodes use a script in
+  `slurm/inference/large/`, which starts a vLLM server over Ray and sends it the prompts.
+- **Agentic inference** uses a script in `slurm/inference/agentic/`. It starts a vLLM
+  server, then runs **Harbor** on the host. Harbor starts one Singularity container per
+  task from the agentic image and runs **OpenCode** inside it. OpenCode talks to the vLLM
+  server through its OpenAI-compatible API.
 
-### src and slurm
-Contains files to launch RuC on a cluster.
+## Setup
 
-### benchmark
-Contains files used to analyze the dataset and create the benchmark.
+You need three Singularity images:
 
-- Collect all selected rule occurrences in the dataset and store them in the same dataset. Inside each folder of the dataset, an `all_mask_idx.json` file is created with the rule occurrences of the HDL file in it.
-- For each rule occurrence, create a copy of the original file with that occurrence removed.
-- Check functional equivalence (EQV) of the empty generations against the original files to ensure that occurrences chosen are functionally meaningful.
-- Select random samples from the functionally meaningful subset in `all_mask_idx.json`, ensuring file-level diversity. `mask_idx.json` is created for each project with the actual positions of the samples of the new benchmark.
+| Image | Used for | Must contain |
+|---|---|---|
+| inference | inference | vLLM |
+| evaluation | benchmark generation, evaluation | Python with `antlr4-python3-runtime`, Yosys (with the [yosys-slang](https://github.com/povik/yosys-slang) plugin for SystemVerilog), Verilator (SystemVerilog) or Icarus Verilog (Verilog) |
+| agentic | agentic tasks | Built from `slurm/inference/agentic/ruc-sim-opencode.def` |
 
+On the login node you need Python with `pyyaml`, to run `src/run.py`.
 
-### inference
-Contains files used to run inference with vLLM on the created benchmark.
-
-
-### evaluation
-Contains files used to evaluate model generations on the created benchmark.
-
-`eval_ruc.py` runs STX and EQV checks by comparing the original files with files where generated code replaces the masked rule occurrences. It reports the average percentage of STX and EQV passes per rule type.
-The STX and EQV scripts are in `eval_notsotiny.py`.
-
-
-## Cluster Usage
-Each project folder in the dataset must contain exactly one HDL file, named identically to the top module (i.e., <top_module_name>.sv or .v, matching the module declaration inside the file).
-
-We recommend preprocessing the design (e.g., with vppreproc) to produce a single, self-contained file with all includes and macros resolved.
-```
-<dataset_path>
-|-- <p1>
-|----<p1_top_module>.sv
-|-- <p2>
-|----<p2_top_module>.sv
-```
-
-
-1. Edit `configs/slurm.yml`.
-Adjust the SLURM configuration to match your cluster setup. Each configuration entry defines a reusable SLURM profile, referenced later in ruc.yml via slurm_config_inference and slurm_config_evaluate.
-```
-configurations:
-  - type: general-partition-debug
-    account: bsc70
-    qos: gp_debug
-    output: slurm_output/job_%j.out
-    error: slurm_output/job_%j.err
-    nodes: 1
-    time: "02:00:00"
-    ntasks: 1
-    cpus-per-task: 80
-```
-
-2. Edit `configs/ruc.yml`. 
-Specify:
-- HDL of the source projects. Currently supported Verilog (v) and SystemVerilog (sv).
-- Paths to models, dataset, output directory, and singularity images.
-- Model configuration and inference hyperparameters.
+For agentic benchmarks, also build the agentic image and Harbor. Both steps need internet:
 
 ```
-benchmark:
-  - task: RuC
-    hdl: sv # sv (SystemVerilog) or v (Verilog)
-    dataset_path: /gpfs/scratch/bsc70/hpai/storage/projects/heka/chips-design/bigcode/datasets/RuC-cve2_b72358c7-32k/
-    model_path: /gpfs/scratch/bsc70/hpai/storage/projects/heka/models/  # Folder containing the models
-    output_path: /gpfs/scratch/bsc70/hpai/storage/projects/heka/chips-design/bigcode/results/RuC-CVE2-32k/  # Folder to store the generation results
-    singularity_image: /gpfs/scratch/bsc70/hpai/storage/projects/heka/chips-design/bigcode/containers/inference_images/vllm-openai-0.10.1-k2.sif  # Singularity image for inference
-    evaluation_image: /gpfs/scratch/bsc70/hpai/storage/projects/heka/chips-design/bigcode/containers/inference_images/ruc-eval-slang.sif  # Singularity image for evaluation and benchmark creation
-    models:
-      - name: Qwen2.5-Coder-14B
-        slurm_config_inference: accelerate-partition-debug
-        slurm_config_evaluate: general-partition-debug
-        precision: bfloat16
-        temperature: 0.2
-        sequence_length_limit: 32768
-        max_tokens: 2048
-        top_p: 0.95
-        top_k: -1
-        gpu_memory_utilization: 0.85
-        swap_space: 16
-        tensor_parallel_size: 4
-        batch_size: 64
-        debug: true
-```
-The inference Singularity image must include vLLM and its dependencies. The evaluation image must include antlr4-python3-runtime and Yosys, or yosys-slang depending on the Yosys flow used.
-
-3. Edit `configs/rules.py`.
-Select the desired rules to create the benchmark.
-```
-RULES = [
-        "module_program_interface_instantiation",
-        "continuous_assign",
-]
+cd slurm/inference/agentic
+./fetch_vendor.sh                     # set OPENCODE_VERSION to pin OpenCode
+singularity build --fakeroot ruc-sim-opencode.sif ruc-sim-opencode.def
+cd -
+third_party/harbor/setup_harbor.sh    # patched Harbor, see third_party/harbor/README.md
 ```
 
-4. Edit `configs/prompts.py`.
-Define:
-- FIM template used for fill-in-the-middle-based prompting
-- System prompt used for chat-based prompting
+Then edit the configuration:
+
+- `configs/ruc.yml`: HDL (`sv` or `v`), the paths to the dataset, models, results and
+  images, and one entry per model with its sampling parameters. The `agentic` block sets
+  the task shape and the time budgets.
+- `configs/slurm.yml`: your account, QoS and partitions.
+- `configs/rules.py`: the grammar rules RuC may remove.
+- `configs/prompts.py`: the FIM template and the chat system prompt.
+- The slurm scripts you use: fill in every `<...>` and `/path/to/...`.
+
+Run every command from the repository root.
+
+## Ready-to-use benchmarks
+
+[HPAI-BSC/RuC-datasets](https://huggingface.co/datasets/HPAI-BSC/RuC-datasets) holds the
+rule-completion benchmarks of the paper, already generated:
+
+## Generate a rule-completion benchmark
+
+**Input.** One folder per design, holding one file named after its top module. Flatten
+each design first, so includes and macros are resolved (for example with `vppreproc`):
+
 ```
-FIM_TEMPLATE = "<|fim_prefix|>{prefix}<|fim_suffix|>{suffix}<|fim_middle|>"
-
-SYSTEM_PROMPT = """
-    You are a professional Verilog hardware designer.
-    ...
-"""
+<dataset_path>/
+├── <design_1>/<top_module>.sv
+└── <design_2>/<top_module>.sv
 ```
 
-5. Create a benchmark:
-```python3 src/run.py --model <model_name> --max_tasks <number_tasks> --fnc --benchmark```
-- --model: Model name whose tokenizer is used to compute token-level statistics and identify rule occurrences (no inference is performed at this stage).
-- --max_tasks: Maximum number of benchmark instances generated per rule.
-- --fnc (optional): Restrict selection to functionally valid occurrences, determined via equivalence checking (significantly increases runtime). If omitted, occurrences are sampled randomly.
+**Generate, run and score:**
 
-This step generates, for each project folder, a file (`mask_idx.json`) containing the start and end indices of selected rule occurrences.
+```
+python3 src/run.py --model <model> --max_tasks <n> [--fnc] --benchmark   # 1. generate the benchmark
+python3 src/run.py --model <model> --prompt chat --inference             # 2. run a model (or fim)
+python3 src/run.py --model <model> --prompt chat --evaluate              # 3. score it
+```
 
-6. Inference with a model on the created benchmark:
-```python3 src/run.py --model <model_name> --prompt <prompt_type> --inference```
-- --model: name of the model to evaluate.
-- --prompt: prompting strategy to use during generation (fim or chat).
+1. Finds every occurrence of the rules in `configs/rules.py` and picks up to `<n>` per
+   rule. `--fnc` keeps only holes whose removal changes what the design does. This is
+   slower, as it runs an equivalence check per candidate. `--model` is only used for its
+   tokenizer, for the token statistics.
+2. For a model that needs several nodes, run `sbatch slurm/inference/large/<model>.sh`
+   instead.
 
-Outputs are written to `output_path/<model_name>/<prompt_type>/`. Inside that directory:
-- One folder is created per rule type.
-- Inside each rule folder, one folder is created per benchmark occurrence.
-- Each occurrence folder contains the model generation and the complete HDL file with the generation inserted in place of the original masked region.
+**What the benchmark looks like.** Step 1 writes two files into each design folder:
+`all_mask_idx.json` with every candidate, and `mask_idx.json` with the holes chosen. Both
+map each rule to character spans in the source:
 
-7. Evaluate the generations:
-```python3 src/run.py --model <model_name> --prompt <prompt_type> --evaluate```
+```json
+{"continuous_assign": [[205, 228], [231, 248]], "always_construct": [[251, 356]]}
+```
 
-Outputs are written to `output_path/<model_name>`. The following files are generated:
-- Generation_eqy_results.json: Per-instance syntax and equivalence results
-- Summary_results.json: Aggregated syntax and equivalence pass rates per rule
+Step 2 writes one folder per hole under `<output_path>/<model>/<prompt>/`. Each one holds
+the model's answer (`gen1.sv`), the design with the answer filled in (`full_gen1.sv`), and
+`gen1.json` with the raw output, the reasoning and the finish reason. Step 3 writes
+`generation_eqy_results.json` (per hole) and `summary_results.json` (per rule).
 
+## Generate an agentic benchmark
 
-### Multi-node inference
-To do inference on larger model across multiple nodes, we support vLLM + Ray under SLURM.
-- SLURM → allocates nodes and GPUs
-- Ray → connects those nodes into a cluster
-- vLLM → runs the model across that cluster
-- Benchmark script → sends inference requests
+**Input.** One folder per project, with its real source tree. Each project gets a
+`ruc_project.json` with its top module and source order, which you can edit by hand.
+Existing ones are never overwritten. Folders whose name starts with `_` are skipped. Use
+one, such as `_lib/`, for code shared by several projects.
 
-Use as a template `slurm/inference/gpt-oss-120b-0109.sh`, and create your own `slurm/inference/<model_name>.sh` with your specific configurations. 
-In order to run it:
-`sbatch slurm/inference/<model_name>.sh`
+```
+<dataset_path>/
+├── _lib/                    shared code, filled by the dependency resolver
+└── <project>/
+    ├── ruc_project.json
+    └── rtl/*.sv
+```
+
+**Generate, run and score:**
+
+```
+# once per dataset: write the manifests, then copy in the modules and headers the projects use from elsewhere
+python3 -c "from benchmark.project_manifest import generate_manifests; generate_manifests('<dataset>', 'sv')"
+python3 -m benchmark.dependency_resolver --dataset_path <dataset> --hdl sv --search_path <repo> --write
+
+python3 src/run.py --model <model> --agentic --self --evaluate                       # check the dataset
+python3 src/run.py --model <model> --max_tasks <n> [--fnc] --agentic --benchmark     # generate the benchmark
+sbatch slurm/inference/agentic/<model>.sh                                            # run a model
+python3 src/run.py --model <model> --agentic --evaluate                              # score it
+```
+
+- `--self --evaluate` proves each project equivalent to itself. A project that fails can
+  never be scored, so fix or drop it before generating tasks.
+- The shape of a task is set in the `agentic` block of `configs/ruc.yml`: `holes_per_task`,
+  `min_files_per_task` and `min_rules_per_task`. With one hole per task, `<n>` is the
+  number of tasks per rule. With more, it is the number of tasks per project.
+- The `sbatch` step cannot go through `src/run.py`: Harbor has to start containers itself,
+  so it runs on the host rather than inside one.
+
+**What the benchmark looks like.** One [Harbor](https://github.com/harbor-framework/harbor)
+task per bundle of holes, under `<output_path>/tasks/`:
+
+```
+<project>-bundle00/
+├── task.toml          time budgets and the image to run in
+├── instruction.md     the prompt given to the agent
+├── environment/       the project with its holes removed, copied to /app for the agent
+├── tests/test.sh      checks run after the agent finishes
+└── solution/          the original sources and the hole positions, never shown to the agent
+```
+
+Each hole is marked in the sources the agent sees:
+
+```systemverilog
+  // RUC_HOLE_BEGIN id=h1
+  // RUC_HOLE_END id=h1
+```
+
+The agent writes its code between the markers. A hole whose markers are deleted counts as
+failed. Scoring writes the same result files as rule completion, plus how many tasks were
+solved in full.
+
+The same holes can also be scored without an agent. This turns the tasks into a
+rule-completion benchmark. Point `dataset_path` at `<export>` and run steps 2 and 3 of the
+rule-completion flow, without `--benchmark`:
+
+```
+python3 -m benchmark.export_rule_completion <output_path>/tasks --dataset_path <dataset> --output_path <export>
+```
+
+## Good to know
+
+- **Resuming.** Relaunching inference resumes it: finished holes or tasks are skipped.
+- **Timeouts.** An equivalence check that times out counts as a pass, unless
+  `timeout_is_pass: False` is set. `equiv_method` in the results says how each proof
+  ended: `proven`, `failed`, `timeout` or `error`.
+- **New models.** Adapt the vLLM flags from the scripts in `slurm/`, such as parallelism, tool
+  and reasoning parsers, and context length.

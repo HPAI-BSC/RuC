@@ -4,10 +4,11 @@ from configs.rules import RULES
 from .utils import complete_code, find_hdl_files
 
 """
-For each rule occurrence, create a copy of the original SystemVerilog file with that occurrence removed (Evaluate it to observe which rule occurrences are functionally meaningful and can be selected to create the benchmark).
+For each rule occurrence, create a copy of the original SystemVerilog file with that occurrence removed (Evaluate
+it to observe which rule occurrences are functionally meaningful and can be selected to create the benchmark).
 """
 
-def not_generate(root_dir, output_dir, hdl, debug):
+def generate_empty_outputs(root_dir, output_dir, hdl, debug):
     count = 0
     for subdir, _, files in os.walk(root_dir):
         modules = find_hdl_files(files, hdl)
@@ -15,19 +16,17 @@ def not_generate(root_dir, output_dir, hdl, debug):
         if not modules or "all_mask_idx.json" not in files:
             continue
 
-        if len(modules) > 1:
-            print(f"Warning: multiple HDL files in {subdir}, picking first: {modules[0]}")
+        if debug and len(modules) > 1:
+            print(f"[WARNING] multiple HDL files in {subdir}, picking first: {modules[0]}")
 
         module_file = os.path.join(subdir, modules[0])
         mask_file = os.path.join(subdir, "all_mask_idx.json")
         if debug:
-            print(f"Modules path: {module_file}")
+            print(f"[INFO] Modules path: {module_file}")
 
         with open(module_file, 'r') as f:
             text = f.read()
 
-        #print("\n\nOriginal text:")
-        #print(text)
 
         with open(mask_file, 'r') as mf:
             mask_lines = json.load(mf)
@@ -56,7 +55,7 @@ def not_generate(root_dir, output_dir, hdl, debug):
                 os.makedirs(os.path.dirname(save_path_gen), exist_ok=True)
                 os.makedirs(os.path.dirname(save_path_full_gen), exist_ok=True)
                 if debug:
-                    print(f"save_path_gen: {save_path_gen}")
+                    print(f"[INFO] save_path_gen: {save_path_gen}")
 
                 with open(save_path_gen, 'w') as out_gen:
                     out_gen.write(gen_text)
@@ -65,6 +64,27 @@ def not_generate(root_dir, output_dir, hdl, debug):
 
                 count += 1
 
-    print(f"Total occurrences processed: {count}")
-                    
-            
+    print(f"[INFO] Total occurrences processed: {count}")
+
+
+def write_hole(save_dir, hole, source_text, hdl, generation=""):
+    """
+    Write one hole of a multi-file project.
+
+    Only the source holding the hole is written out, not the whole project: every other
+    source is still the golden one, so the checker rebuilds the design by swapping this
+    single file into the manifest source list. `hole.json` records what was replaced, so
+    the folder describes itself and the evaluator does not have to guess a layout.
+    """
+    filled_code = complete_code(source_text, hole["span"], generation)
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    with open(os.path.join(save_dir, "gen1." + hdl), "w") as out_gen:
+        out_gen.write(generation)
+
+    with open(os.path.join(save_dir, "full_gen1." + hdl), "w") as out_full_gen:
+        out_full_gen.write(filled_code)
+
+    with open(os.path.join(save_dir, "hole.json"), "w") as out_hole:
+        json.dump(hole, out_hole, indent=4)
